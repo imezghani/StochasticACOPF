@@ -27,10 +27,10 @@ function solveRobustACOPF(Scen::Array{Scenario},
     @variable(m, -rate_a[i] <= varfp_to[i=keys(netbranch),ScID] <= rate_a[i])
     @variable(m, -rate_a[i] <= varfq_fr[i=keys(netbranch),ScID] <= rate_a[i])
     @variable(m, -rate_a[i] <= varfq_to[i=keys(netbranch),ScID] <= rate_a[i])
-    
+
     @constraint(m, DefpgRef[i=RefGen],
                 p0[i]==sum(varpg[i,s] for s=ScID)/length(Scen))
-    
+
     @constraint(m, Defvgen[i=keys(netgen),s=ScID],
                 vgen[i]==varvm[string(netgen[i]["gen_bus"]),s])
 
@@ -101,7 +101,7 @@ function solveRobustACOPF(Scen::Array{Scenario},
         + sum(varfq_to[b,s] for b=branch_t[i])
         ==
         + sum(varqg[g,s] for g=gen_i[i])
-        - sum(qd[d]+Scen[s].loadQ[d] for d=load_i[i]) 
+        - sum(qd[d]+Scen[s].loadQ[d] for d=load_i[i])
         + sum(netshunt[s]["bs"] for s=shunt_i[i])*varvm[i,s]^2
     )
 
@@ -114,7 +114,7 @@ function solveRobustACOPF(Scen::Array{Scenario},
               for g=keys(netgen) if length(netgen[g]["cost"]) == 3)
     )
 
-    optimize!(m, with_optimizer(Ipopt.Optimizer)) 
+    optimize!(m, with_optimizer(Ipopt.Optimizer))
 
     PG0=Dict{String, Float64}(i=>value(p0[i]) for i=NonSlackGen)
     V0=Dict{String, Float64}(i=>value(varvm[i,1])
@@ -127,6 +127,21 @@ function solveDeterministic(pertLoads::Set{String},
                             pert::Float64
                             )
     return solveRobustACOPF([CentralScenario()],pertLoads,pert)
+end
+
+function solveOPF()
+    res=run_ac_opf(network,with_optimizer(Ipopt.Optimizer))
+    sol=res["solution"]
+    PG0=Dict{String, Float64}(i=>sol["gen"][i]["pg"] for i=NonSlackGen)
+    V0=Dict{String, Float64}(i=>sol["bus"][i]["vm"]
+                             for i=keys(netbus) if netbus[i]["bus_type"]!=1)
+    return PG0, V0
+end
+
+function distance_to_opf(PG0,V0)
+    PG00,V00=solveOPF()
+    return (sqrt(sum(abs2,PG0[i]-PG00[i] for i=keys(PG0))),
+            sqrt(sum(abs2,V0[i]-V00[i] for i=keys(V0))))
 end
 
 function GenCost(res)
@@ -184,6 +199,97 @@ function SampleScenario(Scen::Scenario,
     return results
 end
 
+
+function SampleScenarios(Scens::Array{Scenario},
+                  PG0::Dict{String,Float64},V0::Dict{String,Float64},
+                  pertLoads::Set{String}, pert::Float64)
+    println("> SAMPLING : $(length(Scens)) samples")
+    (pertPUp,pertPDown,pertQUp,pertQDown) = BoundsLoads(pertLoads,pert)
+    alpha=DefAlpha(pertLoads,pert)
+    passedScen=Array{Scenario}(undef,0)
+    failedScen=Array{Scenario}(undef,0)
+    ConstrViolFailedScen=Array{Array{String}}(undef,0)
+    MaxViolFailedScen=Array{Float64}(undef,0)
+    ConstrViolToScen=Dict{String,Array{Tuple{Float64,Scenario,Scenario}}}()
+    ConstrMaxViol=Array{String}(undef,0)
+    results=Any
+    nbInfeasible=0
+    nbPFInfeasible=0
+    maxViol=0.0
+    for i=NonSlackGen
+        network["gen"][i]["pg"]=PG0[i]
+    end
+    for i=keys(netgen)
+        network["gen"][i]["vg"]=V0[string(netgen[i]["gen_bus"])]
+    end
+    for i=keys(netbus)
+        if netbus[i]["bus_type"]!=1
+            network["bus"][i]["vm"]=V0[i]
+        end
+    end
+    for s=1:length(Scens)
+        if s % 100 == 0 println("s=",s) end
+        for i=pertLoads
+            network["load"][i]["pd"]=Scens[s].loadP[i]
+            network["load"][i]["qd"]=Scens[s].loadQ[i]
+        end
+        Scen=Scenario(
+            Dict{String,Float64}(i=>network["load"][i]["pd"]-pd[i]
+                                 for i=keys(netload)),
+            Dict{String,Float64}(i=>network["load"][i]["qd"]-qd[i]
+                                 for i=keys(netload))
+        )
+        w=sum(network["load"][i]["pd"] for i=keys(netload)) - sum(values(pd))
+        for i=NonSlackGen
+            network["gen"][i]["pg"]=PG0[i]+alpha[i]*w
+        end
+        results=run_ac_pf(network,with_optimizer(Ipopt.Optimizer,
+                                                 print_level=0,
+                                                 max_iter=250))
+        if results["termination_status"] != LOCALLY_SOLVED
+            nbInfeasible+=1
+            continue
+        end
+        ConstrViol,ViolConstr=checkSolution(results,false)
+        if  length(ConstrViol) > 0
+            maxViol=max(maxViol,maximum(ViolConstr))
+            #println("omega:",w)
+            push!(failedScen,Scen)
+            push!(ConstrViolFailedScen,ConstrViol)
+            push!(MaxViolFailedScen,maximum(ViolConstr))
+            push!(ConstrMaxViol,ConstrViol[findfirst((j->j==maximum(ViolConstr)),
+                                          ViolConstr)])
+            for c=1:length(ConstrViol)
+                push!(get!(ConstrViolToScen,ConstrViol[c],
+                           Array{Tuple{Float64,Scenario,Scenario}}(undef,0)),
+                      (ViolConstr[c],Scen,CentralScenario())
+                      )
+            end
+            nbPFInfeasible+=1
+        else
+            push!(passedScen,Scen)
+        end
+    end
+    # println("There are ", nbPFInfeasible,
+    #         " infeasible PF solutions violating OPF constraints out of ",
+    #         NbSamples, ".")
+    println("Max violation of constraints: ", maxViol*100, "%")
+    if !isempty(failedScen)
+        println("Expected max violation when failing: ",
+                Statistics.mean(MaxViolFailedScen)*100, "%" )
+        println("Expected number of violated constraints when failing: ",
+                ceil(Int64,Statistics.mean(length(i)
+                                           for i=ConstrViolFailedScen)))
+    end
+    for i=keys(network["load"])
+        network["load"][i]["pd"]=pd[i]
+        network["load"][i]["qd"]=qd[i]
+    end
+    return (nbPFInfeasible,maxViol*100,passedScen,failedScen,
+            ConstrViolFailedScen,MaxViolFailedScen,ConstrViolToScen,
+            ConstrMaxViol)
+end
+
 function SamplePF(NbSamples::Int64,
                   PG0::Dict{String,Float64},V0::Dict{String,Float64},
                   pertLoads::Set{String}, pert::Float64)
@@ -194,7 +300,7 @@ function SamplePF(NbSamples::Int64,
     failedScen=Array{Scenario}(undef,0)
     ConstrViolFailedScen=Array{Array{String}}(undef,0)
     MaxViolFailedScen=Array{Float64}(undef,0)
-    ConstrViolToScen=Dict{String,Array{Tuple{Float64,Scenario}}}()
+    ConstrViolToScen=Dict{String,Array{Tuple{Float64,Scenario,Scenario}}}()
     ConstrMaxViol=Array{String}(undef,0)
     results=Any
     nbInfeasible=0
@@ -237,7 +343,7 @@ function SamplePF(NbSamples::Int64,
             continue
         end
         ConstrViol,ViolConstr=checkSolution(results,false)
-        if  length(ConstrViol) > 0 
+        if  length(ConstrViol) > 0
             maxViol=max(maxViol,maximum(ViolConstr))
             #println("omega:",w)
             push!(failedScen,Scen)
@@ -248,7 +354,7 @@ function SamplePF(NbSamples::Int64,
             for c=1:length(ConstrViol)
                 push!(get!(ConstrViolToScen,ConstrViol[c],
                            Array{Tuple{Float64,Scenario}}(undef,0)),
-                      (ViolConstr[c],Scen)
+                      (ViolConstr[c],Scen,CentralScenario())
                       )
             end
             nbPFInfeasible+=1
@@ -284,7 +390,7 @@ function checkSolution(res,verbosity::Bool)
     qg=Dict{String,Float64}(i => gen[i]["qg"] for i=keys(gen))
     vm=Dict{String,Float64}(i => bus[i]["vm"] for i=keys(bus))
     va=Dict{String,Float64}(i => bus[i]["va"] for i=keys(bus))
-    
+
     fp_fr=Dict{String,Float64}(
         i=> (g[i]+g_fr[i])*(vm[f_bus[i]]/tap[i])^2
         - g[i]*vm[f_bus[i]]/tap[i]*vm[t_bus[i]]*(
@@ -313,7 +419,7 @@ function checkSolution(res,verbosity::Bool)
         - g[i]*vm[t_bus[i]]*vm[f_bus[i]]/tap[i]*(
             sin(va[t_bus[i]]-va[f_bus[i]]+shift[i]))
         for i=keys(netbranch))
-    
+
     VDown=Set{String}()
     VUp=Set{String}()
     PgDown=Set{String}()
@@ -332,7 +438,7 @@ function checkSolution(res,verbosity::Bool)
             push!(ConstrViol,"PgUp$i")
             push!(ViolConstr,
                   abs(mapreduce(sum,+,pg[g] - pmax[g] for g=gen_i[i];init=0))/(
-                      abs(mapreduce(sum,+,pmax[g] for g=gen_i[i];init=0)))
+                      abs(mapreduce(sum,+,pmax[g]-pmin[g] for g=gen_i[i];init=1)))
                   )
         end
         if mapreduce(sum,+,pmin[g] - pg[g] for g=gen_i[i];init=0) > tol
@@ -340,7 +446,7 @@ function checkSolution(res,verbosity::Bool)
             push!(ConstrViol,"PgDown$i")
             push!(ViolConstr,
                   abs(mapreduce(sum,+,pg[g] - pmin[g] for g=gen_i[i];init=0))/(
-                      abs(mapreduce(sum,+,pmin[g] for g=gen_i[i];init=0)))
+                      abs(mapreduce(sum,+,pmax[g]-pmin[g] for g=gen_i[i];init=1)))
                   )
         end
         if mapreduce(sum,+,qg[g] - qmax[g] for g=gen_i[i];init=0) > tol
@@ -348,7 +454,7 @@ function checkSolution(res,verbosity::Bool)
             push!(ConstrViol,"QgUp$i")
             push!(ViolConstr,
                   abs(mapreduce(sum,+,qg[g] - qmax[g] for g=gen_i[i];init=0))/(
-                      abs(mapreduce(sum,+,qmax[g] for g=gen_i[i];init=0)))
+                      abs(mapreduce(sum,+,qmax[g]-qmin[g] for g=gen_i[i];init=1)))
                   )
         end
         if mapreduce(sum,+,qmin[g] - qg[g] for g=gen_i[i];init=0) > tol
@@ -356,22 +462,22 @@ function checkSolution(res,verbosity::Bool)
             push!(ConstrViol,"QgDown$i")
             push!(ViolConstr,
                   abs(mapreduce(sum,+,qg[g] - qmin[g] for g=gen_i[i];init=0))/(
-                      abs(mapreduce(sum,+,qmin[g] for g=gen_i[i];init=0)))
+                      abs(mapreduce(sum,+,qmax[g]-qmin[g] for g=gen_i[i];init=1)))
                   )
         end
         if vm[i] - vmax[i] > tol
             push!(VUp, i)
             push!(ConstrViol,"VUp$i")
-            push!(ViolConstr,abs(vm[i]-vmax[i])/abs(vmax[i]))
+            push!(ViolConstr,abs(vm[i]-vmax[i])/abs(vmax[i]-vmin[i]))
         end
         if vmin[i] - vm[i] > tol
             push!(VDown, i)
             push!(ConstrViol,"VDown$i")
-            push!(ViolConstr,abs(vm[i]-vmin[i])/abs(vmin[i]))
+            push!(ViolConstr,abs(vm[i]-vmin[i])/abs(vmax[i]-vmin[i]))
         end
     end
     for b=keys(netbranch)
-        if fp_fr[b]^2+fq_fr[b]^2 - rate_a[b]^2 > tol 
+        if fp_fr[b]^2+fq_fr[b]^2 - rate_a[b]^2 > tol
             push!(FlowLimFr,[f_bus[b],t_bus[b]])
             push!(ConstrViol,"FlowLimFr$b")
             push!(ViolConstr,(fp_fr[b]^2+fq_fr[b]^2-rate_a[b]^2)/rate_a[b]^2)
@@ -399,7 +505,7 @@ function checkSolution(res,verbosity::Bool)
         println("Max violation of constraints: ", maxViol*100, "%")
         println("Number of constraints violated: ", nbConstrViol)
     end
-return ConstrViol,ViolConstr
+    return ConstrViol,ViolConstr
 end
 
 
@@ -409,6 +515,7 @@ function IterateRACOPF(Clusters::Array{Scenario},
                        maxNbScen::Int64, pertLoads::Set{String}, pert::Float64,
                        method::String,pushing::String
                        )
+    NbIterations=0
     (pertPUp,pertPDown,pertQUp,pertQDown) = BoundsLoads(pertLoads,pert)
     PG0=Dict{String,Float64}
     V0=Dict{String,Float64}
@@ -418,12 +525,12 @@ function IterateRACOPF(Clusters::Array{Scenario},
         res=SamplePF(nbSamples,PG0,V0,pertLoads,pert)
         if length(res[4])==0
             println(">> SUCCESS: It's all done!")
-            return PG0,V0
+            return PG0,V0,NbIterations
         end
         if length(Clusters)==maxNbScen
             println("\n\n$(length(Clusters)) (=Max!) scenarios",
                     " in scenario set.")
-            return PG0,V0
+            return PG0,V0,NbIterations
         end
         if method=="Random"
             for i=1:min(nbScenToAdd,maxNbScen-length(Clusters))
@@ -462,7 +569,6 @@ function IterateRACOPF(Clusters::Array{Scenario},
         ScenAddHashKey=Set{UInt64}()
         i=1
         p=1
-        ExplConstr=Set{String}()
         println("> SCENARIO SELECTION")
         while (i <= nbScenToAdd && i <= length(setHashConstrViol))
             if length(Clusters)==maxNbScen
@@ -470,8 +576,8 @@ function IterateRACOPF(Clusters::Array{Scenario},
                         " in scenario set.")
                 PG0,V0=solveRobustACOPF(Clusters,pertLoads,pert)
                 res=SamplePF(nbSamples,PG0,V0,pertLoads,pert)
-                return PG0,V0
-            end 
+                return PG0,V0,NbIterations
+            end
             if countHCV[p][5] in ScenAddHashKey
                 p+=1
                 continue
@@ -485,7 +591,7 @@ function IterateRACOPF(Clusters::Array{Scenario},
                         push!(Clusters,PutScenExtreme(res[4][j],pertLoads,pert))
                     elseif pushing=="GradPush"
                         push!(Clusters,
-                              GradPush(res[4][j],res[7],PG0,V0,ExplConstr,
+                              GradPush(res[4][j],res[7],PG0,V0,
                                        pertLoads,pert))
                     else
                         push!(Clusters, res[4][j])
@@ -496,8 +602,8 @@ function IterateRACOPF(Clusters::Array{Scenario},
             i+=1
             p+=1
         end
+        NbIterations+=1
     end
     #println(">> FINISHED: $(length(Clusters)) > $(maxNbScen).")
-    return PG0,V0
+    return PG0,V0,NbIterations
 end
-
